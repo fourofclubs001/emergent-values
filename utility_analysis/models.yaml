@@ -1,13 +1,13 @@
 # ------------------------------
 # Small HuggingFace models (for Colab free T4)
 # ------------------------------
-qwen25-15b-instruct:
+qwen25-15b-instruct-colab:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"
   model_type: huggingface
   path: "Qwen/Qwen2.5-1.5B-Instruct"
   gpu_count: 1
 
-qwen25-3b-instruct:
+qwen25-3b-instruct-colab:
   model_name: "Qwen/Qwen2.5-3B-Instruct"
   model_type: huggingface
   path: "Qwen/Qwen2.5-3B-Instruct"
