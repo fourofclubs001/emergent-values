@@ -21,7 +21,11 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from huggingface_hub import login
 from PIL import Image
 from tqdm import tqdm
-from vllm import LLM, SamplingParams
+try:
+    from vllm import LLM, SamplingParams
+except ImportError:
+    LLM = None
+    SamplingParams = None
 import torch  # Import torch to detect GPUs
 import torch.nn.functional as F
 from transformers import (
