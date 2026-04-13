@@ -1,0 +1,4 @@
+# Pre-computed utilities downloaded from HuggingFace (mmazeika/emergent-values-data)
+# Too large to commit (~118MB). Re-download with:
+#   cd utility_analysis && curl -L https://huggingface.co/mmazeika/emergent-values-data/resolve/main/options_hierarchical.zip -o options_hierarchical.zip && mkdir -p shared_utilities && unzip options_hierarchical.zip -d shared_utilities && rm options_hierarchical.zip
+utility_analysis/shared_utilities/
