@@ -2,8 +2,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Tuple, Any, Optional, Set
-from ...compute_utilities import UtilityModel
-from ...utils import generate_responses, parse_responses_forced_choice
+from ...compute_utilities import UtilityModel, PreferenceGraph
+from ...utils import generate_responses, parse_responses_forced_choice, convert_numpy
 from .utils import fit_thurstonian_model, evaluate_thurstonian_model
 import random
 from collections import defaultdict
@@ -158,6 +158,27 @@ def generate_pseudolabels(
     return pseudolabels_counts
 
 
+def _save_checkpoint(checkpoint_path: Optional[str], completed_iteration: int, graph: 'PreferenceGraph') -> None:
+    """Atomically persist active-learning progress so a killed/timed-out Kaggle
+    session can resume from the last completed iteration instead of restarting
+    from scratch. Refitting utilities from a saved graph is near-instant
+    (<1s -- it's the LLM generation calls that are expensive, not the MLE fit),
+    so only the collected preference edges need to survive, not the fitted
+    utilities themselves. Writes to a temp file then renames, so a kill
+    mid-write can't leave a corrupt checkpoint behind."""
+    if not checkpoint_path:
+        return
+    payload = {
+        "stage": "training",
+        "completed_iteration": completed_iteration,
+        "graph_data": graph.export_data(),
+    }
+    tmp_path = checkpoint_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(convert_numpy(payload), f)
+    os.replace(tmp_path, checkpoint_path)
+
+
 # ===================== UTILITY MODEL CLASS ===================== #
 
 class ThurstonianActiveLearningUtilityModel(UtilityModel):
@@ -231,23 +252,33 @@ class ThurstonianActiveLearningUtilityModel(UtilityModel):
     async def fit(
         self,
         graph: 'PreferenceGraph',
-        agent: Any
+        agent: Any,
+        checkpoint_path: Optional[str] = None,
+        deadline_ts: Optional[float] = None
     ) -> Tuple[Dict[Any, Dict[str, float]], Dict[str, float]]:
         """
         Fit the model using active learning to select edges.
-        
+
         Args:
             graph: PreferenceGraph object containing the preference data
             agent: The agent used for generating comparisons
-            
+            checkpoint_path: If set, save progress here after every iteration
+                (initial pass + each active-learning refit) and resume from it
+                if it already exists, instead of restarting from scratch.
+            deadline_ts: If set (an absolute time.time()-based timestamp),
+                stop starting new iterations once this is reached -- leaves a
+                resumable checkpoint rather than risking a hard kill (e.g.
+                Kaggle's session time limit) mid-iteration with nothing saved.
+
         Returns:
             Tuple containing:
             - option_utilities: Dict mapping each option ID to {'mean': float, 'variance': float}
-            - metrics: Dict containing model metrics like log_loss and accuracy
+            - metrics: Dict containing model metrics like log_loss, accuracy,
+              num_iterations, completed_iterations, and early_stopped_time_budget
         """
         if self.comparison_prompt_template is None:
             raise ValueError("comparison_prompt_template must be provided")
-        
+
         # Calculate target number of edges and number of iterations
         N = len(graph.options)
         target_total_edges = int(self.edge_multiplier * N * np.log2(N))
@@ -257,56 +288,96 @@ class ThurstonianActiveLearningUtilityModel(UtilityModel):
             num_iterations = 0
         else:
             num_iterations = int(np.ceil(remainder / self.num_edges_per_iteration))
-            
+
         print(f"Target total edges: {target_total_edges}")
         print(f"Initial edges: {initial_edges}")
         print(f"Number of iterations: {num_iterations}")
-        
-        # Generate initial pairs using regular graph
-        initial_pairs = graph.sample_regular_graph(degree=self.degree, seed=self.seed)
-        if len(initial_pairs) < initial_edges:
-            # If we didn't get enough edges from regular graph, sample additional random edges
-            needed = initial_edges - len(initial_pairs)
-            remaining_edges = list(graph.training_edges_pool - set(initial_pairs))
-            if remaining_edges:
-                additional = random.sample(remaining_edges, min(needed, len(remaining_edges)))
-                initial_pairs.extend(additional)
-        
-        # Get responses for initial pairs
-        preference_data, prompt_list, prompt_idx_to_key = graph.generate_prompts(
-            initial_pairs,
-            self.comparison_prompt_template,
-            include_flipped=self.include_flipped
-        )
-        
-        responses = await generate_responses(
-            agent=agent,
-            prompts=prompt_list,
-            system_message=self.system_message,
-            K=self.K
-        )
-        
-        parsed_responses = parse_responses_forced_choice(responses, with_reasoning=self.with_reasoning)
-        processed_preference_data = self.process_responses(
-            graph=graph,
-            responses=responses,
-            parsed_responses=parsed_responses,
-            prompt_idx_to_key=prompt_idx_to_key
-        )
-        
-        graph.add_edges(processed_preference_data)
-        
-        # Initial fit
-        utilities, model_log_loss, model_accuracy = fit_thurstonian_model(
-            graph=graph,
-            num_epochs=self.num_epochs,
-            learning_rate=self.learning_rate
-        )
 
-        print(f"Initial model - Log Loss: {model_log_loss:.4f}, Accuracy: {model_accuracy * 100:.2f}%")
+        # Resume from a checkpoint if one exists (only ever "training" stage
+        # here -- compute_utilities() intercepts "training_complete" itself
+        # and never calls fit() in that case).
+        start_iteration = 0
+        skip_initial = False
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            with open(checkpoint_path, encoding="utf-8") as f:
+                checkpoint = json.load(f)
+            loaded_graph = PreferenceGraph.load_data(checkpoint["graph_data"])
+            graph.training_edges = loaded_graph.training_edges
+            graph.training_edges_pool = loaded_graph.training_edges_pool
+            graph.holdout_edge_indices = loaded_graph.holdout_edge_indices
+            graph.edges = loaded_graph.edges
+            utilities, model_log_loss, model_accuracy = fit_thurstonian_model(
+                graph=graph,
+                num_epochs=self.num_epochs,
+                learning_rate=self.learning_rate
+            )
+            start_iteration = checkpoint["completed_iteration"]
+            skip_initial = True
+            print(f"Resumed from checkpoint ({checkpoint_path}): completed_iteration={start_iteration}, "
+                  f"refit -> Log Loss: {model_log_loss:.4f}, Accuracy: {model_accuracy * 100:.2f}%")
+
+        stopped_for_time_budget = False
+        if not skip_initial:
+            if deadline_ts and time.time() > deadline_ts:
+                # Even the initial pass hasn't started -- nothing to checkpoint yet,
+                # so there's nothing useful this run can do except report it stopped.
+                print("Time budget already exceeded before the initial pass could start.")
+                stopped_for_time_budget = True
+                utilities, model_log_loss, model_accuracy = {}, float("nan"), float("nan")
+            else:
+                # Generate initial pairs using regular graph
+                initial_pairs = graph.sample_regular_graph(degree=self.degree, seed=self.seed)
+                if len(initial_pairs) < initial_edges:
+                    # If we didn't get enough edges from regular graph, sample additional random edges
+                    needed = initial_edges - len(initial_pairs)
+                    remaining_edges = list(graph.training_edges_pool - set(initial_pairs))
+                    if remaining_edges:
+                        additional = random.sample(remaining_edges, min(needed, len(remaining_edges)))
+                        initial_pairs.extend(additional)
+
+                # Get responses for initial pairs
+                preference_data, prompt_list, prompt_idx_to_key = graph.generate_prompts(
+                    initial_pairs,
+                    self.comparison_prompt_template,
+                    include_flipped=self.include_flipped
+                )
+
+                responses = await generate_responses(
+                    agent=agent,
+                    prompts=prompt_list,
+                    system_message=self.system_message,
+                    K=self.K
+                )
+
+                parsed_responses = parse_responses_forced_choice(responses, with_reasoning=self.with_reasoning)
+                processed_preference_data = self.process_responses(
+                    graph=graph,
+                    responses=responses,
+                    parsed_responses=parsed_responses,
+                    prompt_idx_to_key=prompt_idx_to_key
+                )
+
+                graph.add_edges(processed_preference_data)
+
+                # Initial fit
+                utilities, model_log_loss, model_accuracy = fit_thurstonian_model(
+                    graph=graph,
+                    num_epochs=self.num_epochs,
+                    learning_rate=self.learning_rate
+                )
+
+                print(f"Initial model - Log Loss: {model_log_loss:.4f}, Accuracy: {model_accuracy * 100:.2f}%")
+                _save_checkpoint(checkpoint_path, completed_iteration=0, graph=graph)
 
         # Active learning iterations
-        for iteration in range(num_iterations):
+        completed_iterations = start_iteration
+        for iteration in range(start_iteration, num_iterations):
+            if deadline_ts and time.time() > deadline_ts:
+                print(f"\nTime budget exceeded ({completed_iterations}/{num_iterations} iterations completed) -- "
+                      f"stopping here and leaving a checkpoint to resume from on the next run.")
+                stopped_for_time_budget = True
+                break
+
             print(f"\nIteration {iteration + 1}/{num_iterations}")
             print(f"Sampling up to {self.num_edges_per_iteration} new pairs from the intersection of the bottom {self.P}% utility differences and bottom {self.Q}% total degrees.")
 
@@ -361,9 +432,13 @@ class ThurstonianActiveLearningUtilityModel(UtilityModel):
             )
 
             print(f"Updated model - Log Loss: {model_log_loss:.4f}, Accuracy: {model_accuracy * 100:.2f}%")
+            completed_iterations = iteration + 1
+            _save_checkpoint(checkpoint_path, completed_iteration=completed_iterations, graph=graph)
 
-        # Optional: Generate pseudolabels
-        if self.use_pseudolabels:
+        # Optional: Generate pseudolabels (skipped when stopping early for the
+        # time budget -- this run isn't actually done, so don't mark it as
+        # such or fold in pseudolabels derived from a partially-trained fit).
+        if self.use_pseudolabels and not stopped_for_time_budget:
             print("\nGenerating pseudolabels using the current Thurstonian model.")
             existing_pairs_set = set(
                 (edge.option_A['id'], edge.option_B['id'])
@@ -405,9 +480,12 @@ class ThurstonianActiveLearningUtilityModel(UtilityModel):
 
         metrics = {
             'log_loss': float(model_log_loss),
-            'accuracy': float(model_accuracy)
+            'accuracy': float(model_accuracy),
+            'num_iterations': num_iterations,
+            'completed_iterations': completed_iterations,
+            'early_stopped_time_budget': stopped_for_time_budget
         }
-        
+
         return utilities, metrics
     
     @classmethod

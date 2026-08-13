@@ -349,7 +349,8 @@ async def compute_utilities(
     comparison_prompt_template: Optional[str] = None,
     with_reasoning: Optional[bool] = None,
     save_dir: str = "results",
-    save_suffix: Optional[str] = None
+    save_suffix: Optional[str] = None,
+    deadline_ts: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Compute utilities for a set of options using a specified utility model.
@@ -365,9 +366,16 @@ async def compute_utilities(
         system_message: Optional system message for the agent. If provided, overrides the value in compute_utilities.yaml
         comparison_prompt_template: Optional template for comparison prompts. If provided, overrides the value in compute_utilities.yaml
         with_reasoning: Whether to use reasoning-based response parsing. If provided (True/False), overrides the config value
-        save_dir: Directory to save results
+        save_dir: Directory to save results. Also where checkpoint/resume state
+            is kept (checkpoint_<save_suffix>.json) -- if a prior run left one
+            here, this run resumes from it instead of starting over.
         save_suffix: Suffix for saved files
-        
+        deadline_ts: Optional absolute time.time()-based deadline. Utility
+            models that support it (currently ThurstonianActiveLearningUtilityModel)
+            will stop starting new active-learning iterations past this point
+            and leave a resumable checkpoint, rather than risk an external
+            hard kill (e.g. Kaggle's session time limit) losing all progress.
+
     Returns:
         Dictionary containing results data
     """
@@ -451,20 +459,73 @@ async def compute_utilities(
         seed=preference_graph_arguments.get('holdout_seed', 42)
     )
     
-    # Fit the model (this will populate training edges)
-    utilities, metrics = await utility_model.fit(graph, agent)
-    
-    # If we have holdout edges, get preferences for them too
-    holdout_metrics = await evaluate_holdout_set(
-        graph=graph,
-        agent=agent,
-        utility_model=utility_model,
-        utilities=utilities,
-        comparison_prompt_template=compute_utilities_arguments['comparison_prompt_template'],
-        system_message=compute_utilities_arguments['system_message'],
-        with_reasoning=compute_utilities_arguments['with_reasoning'],
-        K=compute_utilities_arguments.get('K', 10)
-    )
+    # Determine save suffix now (moved up from the save block below) -- needed
+    # to build checkpoint_path before the fit() call so a resumable/completed
+    # checkpoint from a prior, interrupted run can be picked up here.
+    if save_suffix is None:
+        save_suffix = f"{model_key}_{utility_model_class_name.lower()}"
+    checkpoint_path = None
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)  # must exist before fit() can write checkpoints into it
+        checkpoint_path = os.path.join(save_dir, f"checkpoint_{save_suffix}.json")
+
+    # Fit the model (this will populate training edges), unless a prior run
+    # already finished training and left a "training_complete" checkpoint --
+    # in that case reuse its utilities/metrics directly rather than retraining.
+    checkpoint_complete = None
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        with open(checkpoint_path, encoding="utf-8") as f:
+            _checkpoint = json.load(f)
+        if _checkpoint.get("stage") == "training_complete":
+            checkpoint_complete = _checkpoint
+
+    if checkpoint_complete is not None:
+        print(f"Found a completed-training checkpoint at {checkpoint_path} -- skipping fit(), reusing its utilities/metrics.")
+        utilities = {int(k): v for k, v in checkpoint_complete["utilities"].items()}
+        metrics = checkpoint_complete["metrics"]
+        # Restore the trained graph too, so the saved results' graph_data
+        # reflects the actual training edges rather than an empty graph.
+        loaded_graph = PreferenceGraph.load_data(checkpoint_complete["graph_data"])
+        graph.training_edges = loaded_graph.training_edges
+        graph.training_edges_pool = loaded_graph.training_edges_pool
+        graph.holdout_edge_indices = loaded_graph.holdout_edge_indices
+        graph.edges = loaded_graph.edges
+    else:
+        utilities, metrics = await utility_model.fit(graph, agent, checkpoint_path=checkpoint_path, deadline_ts=deadline_ts)
+        if checkpoint_path and not metrics.get("early_stopped_time_budget"):
+            # Training genuinely finished (not just paused for the time budget) --
+            # mark the checkpoint complete so a later re-run of this same
+            # save_dir skips straight to reusing these utilities instead of
+            # retraining from scratch.
+            tmp_path = checkpoint_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(convert_numpy({
+                    "stage": "training_complete",
+                    "utilities": utilities,
+                    "metrics": metrics,
+                    "graph_data": graph.export_data()
+                }), f)
+            os.replace(tmp_path, checkpoint_path)
+
+    # If we have holdout edges, get preferences for them too -- skipped when
+    # training stopped early for the time budget, since holdout evaluation is
+    # diagnostic-only (doesn't feed back into the utility fit) and this run
+    # will be resumed and retrained anyway; spending more time/quota
+    # evaluating a known-partial fit would just eat into the safety margin
+    # the time budget exists to protect.
+    if metrics.get('early_stopped_time_budget'):
+        holdout_metrics = None
+    else:
+        holdout_metrics = await evaluate_holdout_set(
+            graph=graph,
+            agent=agent,
+            utility_model=utility_model,
+            utilities=utilities,
+            comparison_prompt_template=compute_utilities_arguments['comparison_prompt_template'],
+            system_message=compute_utilities_arguments['system_message'],
+            with_reasoning=compute_utilities_arguments['with_reasoning'],
+            K=compute_utilities_arguments.get('K', 10)
+        )
     
     # Prepare results
     results = {
@@ -481,11 +542,9 @@ async def compute_utilities(
     # Save results if directory provided
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
-        
-        # Determine save suffix
-        if save_suffix is None:
-            save_suffix = f"{model_key}_{utility_model_class_name.lower()}"
-            
+
+        # (save_suffix already resolved above, before the fit()/checkpoint step)
+
         # Convert NumPy types to native Python types before saving
         results_to_save = convert_numpy(results)
             
