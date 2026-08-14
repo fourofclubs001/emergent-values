@@ -30,11 +30,6 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple, Any, Optional
 import importlib
 
-from .utility_models import (
-    ThurstonianActiveLearningUtilityModel,
-)
-
-
 # ===================== DEFAULT PROMPTS ===================== #
 
 class PreferenceEdge:
@@ -335,6 +330,20 @@ class PreferenceGraph:
         edges_list = list(self.training_edges_pool)
         n_edges = min(n_edges, len(edges_list))
         return random.sample(edges_list, n_edges)
+
+
+# Imported here, not at module top, to break a circular import:
+# thurstonian_active_learning.py does `from ...compute_utilities import
+# UtilityModel, PreferenceGraph`, which reaches back into this module -- if
+# that happened while this module was still only partway through executing
+# (as it would from a top-of-file import, before PreferenceGraph below is
+# even defined), PreferenceGraph wouldn't exist yet and the import would
+# fail. ThurstonianActiveLearningUtilityModel is only referenced inside
+# compute_utilities() below, not at module level, so importing it here
+# (after PreferenceGraph is fully defined) is safe.
+from .utility_models import (
+    ThurstonianActiveLearningUtilityModel,
+)
 
 
 async def compute_utilities(
